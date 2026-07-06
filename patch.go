@@ -20,6 +20,7 @@ NODE_ALLOC_RATIO_PERCENT=${NODE_ALLOC_RATIO_PERCENT:-50}
 MIN_NODE_RESERVE_MB=${MIN_NODE_RESERVE_MB:-auto}
 SAFETY_OVERHEAD_MB=${SAFETY_OVERHEAD_MB:-128}
 DISABLE_NUMA_SAFETY=${DISABLE_NUMA_SAFETY:-false}
+NUMA_POLICY=${NUMA_POLICY:-interleave}
 PSI_FULL_AVG10_ABORT=${PSI_FULL_AVG10_ABORT:-5.00}
 PRESSURE_ABORT_SAMPLES=${PRESSURE_ABORT_SAMPLES:-3}
 SWAP_ABORT_DELTA_MB=${SWAP_ABORT_DELTA_MB:-64}
@@ -53,7 +54,7 @@ usage() {
   STRICT_SWAP=false             默认兼容运行；设为 true 时无法保证 swap 隔离则拒绝执行
   NODE_RESERVE_PERCENT=10       每个 NUMA node 至少保留的百分比
   MIN_NODE_RESERVE_MB=auto      每个 NUMA node 至少保留的 MB
-  NODE_ALLOC_RATIO_PERCENT=50   每个 NUMA node 可用余量中最多用于本工具的比例
+  NODE_ALLOC_RATIO_PERCENT=50   最多使用全局可用内存的比例；保留旧变量名以兼容
   HOLDER_CHUNK_MB=64            holder 分块申请大小
   TOUCH_DELAY_MS=50             每个分块触页后的暂停时间
   SWAP_ABORT_DELTA_MB=64        SwapFree 连续下降超过该值则主动退出
@@ -61,11 +62,13 @@ usage() {
   PSI_FULL_AVG10_ABORT=5.00     memory pressure full avg10 连续超过该值则主动退出
   PRESSURE_ABORT_SAMPLES=3      swap/PSI 连续异常多少次后退出
   MEMORY_HIGH_PERCENT=0         默认不设置 memory.high；1-100 时按 memory.max 百分比设置
-  DISABLE_NUMA_SAFETY=false     多 NUMA node 且无 numactl 时是否允许退化为单进程
+  NUMA_POLICY=interleave        多 NUMA node 且有 numactl 时使用 interleave；可设 none 跳过
+  DISABLE_NUMA_SAFETY=false     兼容旧变量；设 true 时等同于 NUMA_POLICY=none
 
 说明:
   v2 只用轻量 Python holder 申请匿名内存、触页一次后睡眠保持。
   Linux 上默认尝试使用 cgroup 限制 holder 内存；cgroup 不可用时继续运行并打印风险警告。
+  没有开启 NUMA 或未安装 numactl 时，会跳过 NUMA 绑定并正常占用内存。
 EOF
 }
 
@@ -426,9 +429,8 @@ detect_nodes() {
     NODE_TOTAL_MB=()
     NODE_FREE_MB=()
     NODE_RESERVE_MB=()
-    NODE_CAPACITY_MB=()
 
-    local dir node total free reserve capacity usable
+    local dir node total free reserve
     for dir in /sys/devices/system/node/node[0-9]*; do
         [[ -d "$dir" ]] || continue
         node=${dir##*node}
@@ -437,133 +439,58 @@ detect_nodes() {
         [[ -n "$total" && -n "$free" ]] || continue
 
         reserve=$(node_reserve_mb "$total")
-        usable=$((free - reserve))
-        if [[ $usable -lt 0 ]]; then
-            usable=0
-        fi
-        capacity=$((usable * NODE_ALLOC_RATIO_PERCENT / 100))
 
         NODE_IDS+=("$node")
         NODE_TOTAL_MB+=("$total")
         NODE_FREE_MB+=("$free")
         NODE_RESERVE_MB+=("$reserve")
-        NODE_CAPACITY_MB+=("$capacity")
     done
 
     if [[ ${#NODE_IDS[@]} -eq 0 ]]; then
-        local fallback_usable
         local fallback_reserve
 
         fallback_reserve=$(node_reserve_mb "$TOTAL_MEMORY_MB")
-        fallback_usable=$((AVAILABLE_MEMORY_MB - fallback_reserve))
-        if [[ $fallback_usable -lt 0 ]]; then
-            fallback_usable=0
-        fi
         NODE_IDS=("none")
         NODE_TOTAL_MB=("$TOTAL_MEMORY_MB")
         NODE_FREE_MB=("$AVAILABLE_MEMORY_MB")
         NODE_RESERVE_MB=("$fallback_reserve")
-        NODE_CAPACITY_MB=("$((fallback_usable * NODE_ALLOC_RATIO_PERCENT / 100))")
     fi
 }
 
 print_nodes() {
     local i
-    log "NUMA 安全容量:"
+
+    if [[ ${#NODE_IDS[@]} -le 1 || "${NODE_IDS[0]}" == "none" ]]; then
+        log "NUMA: 未检测到多个 node，跳过 NUMA 绑定"
+        return
+    fi
+
+    log "NUMA node 诊断（仅作观察，不使用 node MemFree 计算占用上限）:"
     for i in "${!NODE_IDS[@]}"; do
-        echo "    ├─ node ${NODE_IDS[$i]}: total=${NODE_TOTAL_MB[$i]}MB free=${NODE_FREE_MB[$i]}MB reserve=${NODE_RESERVE_MB[$i]}MB usable_for_holder=${NODE_CAPACITY_MB[$i]}MB"
+        echo "    ├─ node ${NODE_IDS[$i]}: total=${NODE_TOTAL_MB[$i]}MB free=${NODE_FREE_MB[$i]}MB reserve_hint=${NODE_RESERVE_MB[$i]}MB"
     done
 }
 
-build_allocation_plan() {
-    ALLOC_NODE_IDS=()
-    ALLOC_NODE_MB=()
-
-    local requested_mb=$1
-    local total_capacity=0
-    local allocated=0
-    local remaining i cap share room add node_count
-
-    node_count=${#NODE_IDS[@]}
-    if [[ $node_count -gt 1 && "$DISABLE_NUMA_SAFETY" != "true" ]] && ! command -v numactl >/dev/null 2>&1; then
-        die "检测到多个 NUMA node，但未安装 numactl；为避免单 node 被打满，默认拒绝执行"
+should_use_numa_interleave() {
+    if [[ "$DISABLE_NUMA_SAFETY" == "true" || "$NUMA_POLICY" == "none" ]]; then
+        return 1
     fi
-
-    for cap in "${NODE_CAPACITY_MB[@]}"; do
-        total_capacity=$((total_capacity + cap))
-    done
-
-    if [[ $total_capacity -le 0 ]]; then
-        die "没有可安全占用的 NUMA 内存余量"
+    if [[ "$NUMA_POLICY" != "interleave" ]]; then
+        warn "未知 NUMA_POLICY=$NUMA_POLICY，将跳过 NUMA 绑定"
+        return 1
     fi
-
-    if [[ $requested_mb -gt $total_capacity ]]; then
-        if [[ "$MEMORY_SIZE" == "auto" ]]; then
-            warn "按 NUMA 余量只能安全占用 ${total_capacity}MB，低于目标需要的 ${requested_mb}MB；将按安全上限执行"
-            requested_mb=$total_capacity
-            NEEDED_MEMORY_MB=$requested_mb
-        else
-            die "用户指定 ${requested_mb}MB 超过 NUMA 安全容量 ${total_capacity}MB，拒绝执行"
-        fi
+    if [[ ${#NODE_IDS[@]} -le 1 || "${NODE_IDS[0]}" == "none" ]]; then
+        return 1
     fi
-
-    for i in "${!NODE_IDS[@]}"; do
-        cap=${NODE_CAPACITY_MB[$i]}
-        if [[ $cap -le 0 ]]; then
-            ALLOC_NODE_IDS+=("${NODE_IDS[$i]}")
-            ALLOC_NODE_MB+=(0)
-            continue
-        fi
-
-        share=$((requested_mb * cap / total_capacity))
-        if [[ $share -eq 0 && $requested_mb -gt 0 ]]; then
-            share=1
-        fi
-        share=$(min_int "$share" "$cap")
-        ALLOC_NODE_IDS+=("${NODE_IDS[$i]}")
-        ALLOC_NODE_MB+=("$share")
-        allocated=$((allocated + share))
-    done
-
-    if [[ $allocated -gt $requested_mb ]]; then
-        remaining=$((allocated - requested_mb))
-        for i in "${!ALLOC_NODE_MB[@]}"; do
-            [[ $remaining -le 0 ]] && break
-            if [[ ${ALLOC_NODE_MB[$i]} -le 0 ]]; then
-                continue
-            fi
-            add=$(min_int "${ALLOC_NODE_MB[$i]}" "$remaining")
-            ALLOC_NODE_MB[$i]=$((ALLOC_NODE_MB[$i] - add))
-            remaining=$((remaining - add))
-        done
-    elif [[ $allocated -lt $requested_mb ]]; then
-        remaining=$((requested_mb - allocated))
-        for i in "${!ALLOC_NODE_MB[@]}"; do
-            [[ $remaining -le 0 ]] && break
-            room=$((NODE_CAPACITY_MB[$i] - ALLOC_NODE_MB[$i]))
-            if [[ $room -le 0 ]]; then
-                continue
-            fi
-            add=$(min_int "$room" "$remaining")
-            ALLOC_NODE_MB[$i]=$((ALLOC_NODE_MB[$i] + add))
-            remaining=$((remaining - add))
-        done
+    if ! command -v numactl >/dev/null 2>&1; then
+        warn "检测到多个 NUMA node，但未安装 numactl；跳过 NUMA 绑定并按普通全局内存占用执行"
+        return 1
     fi
-}
-
-print_allocation_plan() {
-    local i
-    log "holder 分配计划:"
-    for i in "${!ALLOC_NODE_IDS[@]}"; do
-        if [[ ${ALLOC_NODE_MB[$i]} -gt 0 ]]; then
-            echo "    ├─ node ${ALLOC_NODE_IDS[$i]}: ${ALLOC_NODE_MB[$i]}MB"
-        fi
-    done
+    return 0
 }
 
 start_holder() {
-    local node=$1
-    local mb=$2
+    local mb=$1
     local pid
 
     if [[ $mb -le 0 ]]; then
@@ -576,18 +503,22 @@ start_holder() {
         fi
         echo 1000 > "/proc/$BASHPID/oom_score_adj" 2>/dev/null || true
 
-        if [[ "$node" != "none" && "$DISABLE_NUMA_SAFETY" != "true" ]] && command -v numactl >/dev/null 2>&1; then
+        if should_use_numa_interleave; then
             exec nice -n "$NICE_LEVEL" \
-                numactl --cpunodebind="$node" --membind="$node" \
-                python3 "$HOLDER_FILE" "$mb" "$DURATION" "$HOLDER_CHUNK_MB" "$TOUCH_DELAY_MS" "$node"
+                numactl --interleave=all \
+                python3 "$HOLDER_FILE" "$mb" "$DURATION" "$HOLDER_CHUNK_MB" "$TOUCH_DELAY_MS" "interleave"
         else
             exec nice -n "$NICE_LEVEL" \
-                python3 "$HOLDER_FILE" "$mb" "$DURATION" "$HOLDER_CHUNK_MB" "$TOUCH_DELAY_MS" "$node"
+                python3 "$HOLDER_FILE" "$mb" "$DURATION" "$HOLDER_CHUNK_MB" "$TOUCH_DELAY_MS" "global"
         fi
     ) &
     pid=$!
     HOLDER_PIDS+=("$pid")
-    log "holder 已启动: pid=$pid node=$node size=${mb}MB"
+    if should_use_numa_interleave; then
+        log "holder 已启动: pid=$pid policy=interleave size=${mb}MB"
+    else
+        log "holder 已启动: pid=$pid policy=global size=${mb}MB"
+    fi
 }
 
 holders_alive() {
@@ -598,22 +529,6 @@ holders_alive() {
         fi
     done
     return 1
-}
-
-check_node_pressure() {
-    local i node free reserve
-
-    for i in "${!NODE_IDS[@]}"; do
-        node=${NODE_IDS[$i]}
-        [[ "$node" == "none" ]] && continue
-        free=$(read_node_meminfo_mb "$node" MemFree)
-        reserve=${NODE_RESERVE_MB[$i]}
-        if [[ -n "$free" && $free -lt $reserve ]]; then
-            ABORT_REASON="node ${node} MemFree=${free}MB 低于保留水位 ${reserve}MB，主动释放 holder"
-            return 1
-        fi
-    done
-    return 0
 }
 
 monitor_loop() {
@@ -695,10 +610,6 @@ monitor_loop() {
 
         if [[ $psi_pressure_samples -ge $PRESSURE_ABORT_SAMPLES ]]; then
             ABORT_REASON="memory pressure full avg10=${psi} 连续超过阈值 ${PSI_FULL_AVG10_ABORT} 达 ${psi_pressure_samples} 次，主动释放 holder"
-            return 1
-        fi
-
-        if ! check_node_pressure; then
             return 1
         fi
 
@@ -785,8 +696,23 @@ if [[ $NEEDED_MEMORY_MB -lt 10 ]]; then
 fi
 
 print_nodes
-build_allocation_plan "$NEEDED_MEMORY_MB"
-print_allocation_plan
+
+MAX_SAFE_MEMORY=$((AVAILABLE_MEMORY_MB * NODE_ALLOC_RATIO_PERCENT / 100))
+if [[ $NEEDED_MEMORY_MB -gt $MAX_SAFE_MEMORY ]]; then
+    if [[ "$MEMORY_SIZE" == "auto" ]]; then
+        warn "按全局可用内存安全比例限制申请内存为 ${MAX_SAFE_MEMORY}MB，低于目标需要的 ${NEEDED_MEMORY_MB}MB"
+        NEEDED_MEMORY_MB=$MAX_SAFE_MEMORY
+    else
+        warn "用户指定 ${NEEDED_MEMORY_MB}MB 超过当前全局安全建议 ${MAX_SAFE_MEMORY}MB；仍按用户指定执行，并依赖监控止损"
+    fi
+fi
+
+if should_use_numa_interleave; then
+    log "NUMA 策略: numactl --interleave=all"
+else
+    log "NUMA 策略: global（不使用 numactl 绑定）"
+fi
+log "holder 分配计划: ${NEEDED_MEMORY_MB}MB"
 
 CGROUP_LIMIT_MB=$((NEEDED_MEMORY_MB + SAFETY_OVERHEAD_MB + HOLDER_CHUNK_MB))
 enable_cgroup "$CGROUP_LIMIT_MB"
@@ -796,9 +722,7 @@ BASE_SWAP_FREE=$(swap_free_mb)
 BASE_PSWPIN=$(vmstat_value pswpin)
 BASE_PSWPOUT=$(vmstat_value pswpout)
 
-for i in "${!ALLOC_NODE_IDS[@]}"; do
-    start_holder "${ALLOC_NODE_IDS[$i]}" "${ALLOC_NODE_MB[$i]}"
-done
+start_holder "$NEEDED_MEMORY_MB"
 
 if monitor_loop "$BASE_SWAP_FREE" "$BASE_PSWPIN" "$BASE_PSWPOUT"; then
     ok "已完成 ${DURATION}s 内存占用保持"
