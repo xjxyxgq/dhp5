@@ -1,0 +1,18 @@
+    - name: 检查 usera 的 bash_profile 文件
+      ansible.builtin.stat:
+        path: "{{ nudb_alias_user_home }}/.bash_profile"
+      register: nudb_bash_profile
+
+    - name: 删除 usera 的 bash_profile 中的 nudb 别名配置
+      ansible.builtin.lineinfile:
+        path: "{{ nudb_alias_user_home }}/.bash_profile"
+        regexp: '^\s*alias\s+nudb\s*=.*$'
+        state: absent
+      when: nudb_bash_profile.stat.exists
+
+    - name: 以 usera 身份移除 nudb 别名
+      ansible.builtin.shell: unalias nudb 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      become_user: "{{ nudb_alias_user }}"
+      changed_when: false
