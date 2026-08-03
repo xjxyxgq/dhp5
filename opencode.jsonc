@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "code-review-graph": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "code-review-graph",
+        "serve",
+        "--repo",
+        "/Users/xuguoqiang/SynologyDrive/Backup/MI_office_notebook/D/myworkspace/xgq_workspace/program/src/xgq.com/dhp"
+      ]
+    }
+  }
+}
